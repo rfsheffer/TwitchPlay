@@ -1,184 +1,356 @@
 // Copyright (C) Simone Di Gravio <email: altairjp@gmail.com> - All Rights Reserved
 
-#define DEBUG_MSG(msg) GEngine->AddOnScreenDebugMessage( -1 , 6 , FColor::Red , msg )
-
 #include "Components/TwitchIRCComponent.h"
-#include <string>
 
-// Sets default values for this component's properties
-UTwitchIRCComponent::UTwitchIRCComponent()
+FTwitchMessageReceiver::FTwitchMessageReceiver()
+	: SendingQueue(MakeUnique<FTwitchSendMessagesQueue>())
+	, ReceivingQueue(MakeUnique<FTwitchReceiveMessagesQueue>())
+	, ConnectionQueue(MakeUnique<FTwitchConnectionQueue>())
+	, ConnectionSocket(nullptr)
+	, MessagesThread(nullptr)
+	, ShouldExit(false)
+	, WaitingForAuth(false)
 {
-	PrimaryComponentTick.bCanEverTick = true;
+	
 }
 
-void UTwitchIRCComponent::SetUserInfo(FString _oauth, FString _username, FString _channel)
+FTwitchMessageReceiver::~FTwitchMessageReceiver()
 {
-	this->oauth_token_ = _oauth;
-	this->username_ = _username;
-	this->channel_ = _channel;
-	this->b_has_run_user_setup_ = true;
+	if (ConnectionSocket != nullptr)
+	{
+		ConnectionSocket->Close();
+		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ConnectionSocket);
+		ConnectionSocket = nullptr;
+	}
+
+	SendingQueue = nullptr;
+	ReceivingQueue = nullptr;
+	ConnectionQueue = nullptr;
+	MessagesThread = nullptr;
 }
 
-bool UTwitchIRCComponent::SendIRCMessage(FString _message, bool _b_send_to, FString _channel)
+void FTwitchMessageReceiver::StartConnection(const FString& oauth, const FString& username, const FString& channel)
+{
+	checkf(!MessagesThread, TEXT("FTwitchMessageReceiver::StartConnection called more than once?"));
+	Oauth = oauth;
+	Username = username.ToLower();
+	Channel = channel.ToLower();
+	MessagesThread = FRunnableThread::Create(this, TEXT("FTwitchMessageReceiver"));
+}
+
+inline FString ANSIBytesToString(const uint8* In, int32 Count)
+{
+	FString Result;
+	Result.Empty(Count);
+
+	while (Count)
+	{
+		Result += static_cast<ANSICHAR>(*In);
+
+		++In;
+		Count--;
+	}
+	return Result;
+}
+
+uint32 FTwitchMessageReceiver::Run()
+{
+	if(!ConnectionSocket)
+	{
+		// Create the server connection
+		ISocketSubsystem* sss = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+		TSharedRef<FInternetAddr> connection_addr = sss->CreateInternetAddr();
+
+		FAddressInfoResult GAIResult = sss->GetAddressInfo(TEXT("irc.twitch.tv"),
+											     nullptr,
+											     EAddressInfoFlags::Default,
+											     NAME_None);
+		if (GAIResult.Results.Num() == 0)
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Could not resolve hostname!")));
+			return 1; // if the host could not be resolved return false
+		}
+
+		connection_addr->SetRawIp(GAIResult.Results[0].Address->GetRawIp());
+
+		// Set connection port
+		const int32 port = 6667; // Standard IRC port
+		connection_addr->SetPort(port);
+
+		FSocket* ret_socket = sss->CreateSocket(NAME_Stream, TEXT("TwitchPlay Socket"), false);
+
+		// Socket creation might fail on certain subsystems
+		if (ret_socket == nullptr)
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Could not create socket!")));
+			return 1;
+		}
+
+		// Setting underlying connection parameters
+		int32 out_size;
+		ret_socket->SetReceiveBufferSize(2 * 1024 * 1024, out_size);
+		ret_socket->SetReuseAddr(true);
+
+		// Try connection
+		const bool b_has_connected = ret_socket->Connect(*connection_addr);
+
+		// If we cannot connect destroy the socket and return
+		if (!b_has_connected)
+		{
+			ret_socket->Close();
+			sss->DestroySocket(ret_socket);
+
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Connection to Twitch IRC failed!")));
+			return 1;
+		}
+
+		ConnectionSocket = ret_socket;
+
+		const bool pass_ok = SendIRCMessage(TEXT("PASS ") + Oauth);
+		const bool nick_ok = SendIRCMessage(TEXT("NICK ") + Username);
+		const bool b_success = pass_ok && nick_ok;
+		if(b_success)
+		{
+			WaitingForAuth = true;
+		}
+		else
+		{
+			ret_socket->Close();
+			sss->DestroySocket(ret_socket);
+
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT,
+				TEXT("Could not send initial PASS and NICK messages for Auth")));
+			return 1;
+		}
+	}
+
+	while(WaitingForAuth)
+	{
+		FString connectionMessage = ReceiveFromConnection();
+		if(!connectionMessage.IsEmpty())
+		{
+			if(!(connectionMessage.StartsWith(TEXT(":tmi.twitch.tv 001")) && connectionMessage.Contains(TEXT(":Welcome, GLHF!"))))
+			{
+				ISocketSubsystem* sss = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+				ConnectionSocket->Close();
+				sss->DestroySocket(ConnectionSocket);
+				ConnectionSocket = nullptr;
+			
+				ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE, connectionMessage));
+				return 1;
+			}
+
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::CONNECTED, connectionMessage));
+			
+			WaitingForAuth = false;
+
+			if(!Channel.IsEmpty())
+			{
+				const bool join_ok = SendIRCMessage(TEXT("JOIN #") + Channel);
+				if (!join_ok)
+				{
+					ISocketSubsystem* sss = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+					ConnectionSocket->Close();
+					sss->DestroySocket(ConnectionSocket);
+					ConnectionSocket = nullptr;
+			
+					ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE, TEXT("Failed to join channel")));
+					return 1;
+				}
+			}
+		}
+		else
+		{
+			// Wait a bit
+			FPlatformProcess::Sleep(0.1f);
+		}
+	}
+
+	while(ConnectionSocket != nullptr && !ShouldExit)
+	{
+		if(ConnectionSocket->GetConnectionState() == ESocketConnectionState::SCS_Connected)
+		{
+			FString connectionMessage = ReceiveFromConnection();
+			if (!connectionMessage.IsEmpty())
+			{
+				FTwitchReceiveMessages newMessages;
+				ParseMessage(connectionMessage, newMessages.Usernames, newMessages.Messages);
+				if(newMessages.Messages.Num())
+				{
+					ReceivingQueue->Enqueue(newMessages);
+				}
+			}
+
+			// Send our messages
+			FTwitchSendMessage sendMessage;
+			while(SendingQueue->Dequeue(sendMessage))
+			{
+				if(sendMessage.Type == ETwitchSendMessageType::CHAT_MESSAGE)
+				{
+					if(!sendMessage.Channel.IsEmpty())
+					{
+						// Specific user private message
+						SendIRCMessage(sendMessage.Message, sendMessage.Channel);
+					}
+					else if(!Channel.IsEmpty())
+					{
+						// To the currently joined channel
+						SendIRCMessage(sendMessage.Message, Channel);
+					}
+					else
+					{
+						ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::ERROR,
+							TEXT("Cannot send message. No channel specified, and not joined to a channel.")));
+					}
+				}
+				else if(sendMessage.Type == ETwitchSendMessageType::JOIN_MESSAGE)
+				{
+					if(!Channel.IsEmpty())
+					{
+						SendIRCMessage(TEXT("PART #") + Channel);
+					}
+					Channel = sendMessage.Channel;
+					if(!Channel.IsEmpty())
+					{
+						SendIRCMessage(TEXT("JOIN #") + Channel);
+					}
+				}
+			}
+			
+			// Sleep a bit before pulling more messages
+			FPlatformProcess::Sleep(0.1f);
+		}
+		else
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::DISCONNECTED, TEXT("Lost connection to server")));
+			ShouldExit = true;
+		}
+	}
+
+	if(ConnectionSocket)
+	{
+		if(ConnectionSocket->GetConnectionState() == ESocketConnectionState::SCS_Connected)
+		{
+			if(!Channel.IsEmpty())
+			{
+				// Part ways
+				SendIRCMessage(TEXT("PART #") + Channel);
+			}
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::DISCONNECTED, TEXT("Diconnected by request gracefully")));
+		}
+		
+		ConnectionSocket->Close();
+		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ConnectionSocket);
+		ConnectionSocket = nullptr;
+	}
+	
+	return 0;
+}
+
+bool FTwitchMessageReceiver::SendIRCMessage(const FString& message, const FString channel)
 {
 	// Only operate on existing and connected sockets
-	if (connection_socket_ != nullptr && connection_socket_->GetConnectionState() == ESocketConnectionState::SCS_Connected)
+	if (ConnectionSocket != nullptr && ConnectionSocket->GetConnectionState() == ESocketConnectionState::SCS_Connected)
 	{
+		FString messageOut = message;
 		// If the user specified a receiver format the message appropriately ("PRIVMSG")
-		if (_b_send_to)
+		if (!channel.IsEmpty())
 		{
-			_message = "PRIVMSG #" + _channel + " :" + _message;
+			messageOut = FString::Printf(TEXT("PRIVMSG #%s :%s"), *channel, *message);
 		}
-		_message += "\n"; // Using C style strlen needs a terminator character or it will crash
-		TCHAR* serialized_message = _message.GetCharArray().GetData();
-		int32 size = FCString::Strlen(serialized_message);
+		messageOut += TEXT("\n"); // Using C style strlen needs a terminator character or it will crash
+		const TCHAR* serialized_message = GetData(messageOut);
+		const int32 size = FCString::Strlen(serialized_message);
 		int32 out_sent;
-		return connection_socket_->Send((uint8*)TCHAR_TO_UTF8(serialized_message), size, out_sent);
+		return ConnectionSocket->Send(reinterpret_cast<const uint8*>(TCHAR_TO_UTF8(serialized_message)), size, out_sent);
 	}
-	else
+	
+	return false;
+}
+
+void FTwitchMessageReceiver::Stop()
+{
+	ShouldExit = true;
+}
+
+void FTwitchMessageReceiver::Exit()
+{
+}
+
+void FTwitchMessageReceiver::PullMessages(TArray<FString>& usernamesOut, TArray<FString>& messagesOut)
+{
+	if(ReceivingQueue.IsValid() && !ReceivingQueue->IsEmpty())
 	{
-		return false;
+		FTwitchReceiveMessages message;
+		while(ReceivingQueue->Dequeue(message))
+		{
+			usernamesOut.Append(message.Usernames);
+			messagesOut.Append(message.Messages);
+		}
 	}
 }
 
-bool UTwitchIRCComponent::Connect(FString& _out_error)
+void FTwitchMessageReceiver::SendMessage(const ETwitchSendMessageType type, const FString& message, const FString& channel)
 {
-	ISocketSubsystem* sss = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
-	TSharedRef<FInternetAddr> connection_addr = sss->CreateInternetAddr();
-	ESocketErrors socket_error = sss->GetHostByName("irc.twitch.tv", *connection_addr); // Name resolution for Twitch IRC server
-
-	if (socket_error != SE_NO_ERROR)
+	if(SendingQueue.IsValid())
 	{
-		_out_error = "Could not resolve hostname!";
-		return false; // if the host could not be resolved return false
+		SendingQueue->Enqueue(FTwitchSendMessage {type, message, channel});
 	}
+}
 
-	// Set connection port
-	const int32 port = 6667; // Standard IRC port
-	connection_addr->SetPort(port);
-
-	FSocket* ret_socket = sss->CreateSocket(NAME_Stream, TEXT("TwitchPlay Socket"), false);
-
-	// Socket creation might fail on certain subsystems
-	if (ret_socket == nullptr)
+bool FTwitchMessageReceiver::PullConnectionMessage(ETwitchConnectionMessage& statusOut, FString& messageOut)
+{
+	TwitchConnectionPair connectionPair;
+	if(ConnectionQueue->Dequeue(connectionPair))
 	{
-		_out_error = "Could not create socket!";
-		return false;
-	}
-
-	// Setting underlying connection parameters
-	int32 out_size;
-	ret_socket->SetReceiveBufferSize(2 * 1024 * 1024, out_size);
-	ret_socket->SetReuseAddr(true);
-
-	// Try connection
-	bool b_has_connected = ret_socket->Connect(*connection_addr);
-
-	// If we cannot connect destroy the socket and return
-	if (!b_has_connected)
-	{
-		ret_socket->Close();
-		sss->DestroySocket(ret_socket);
-
-		_out_error = "Connection to Twitch IRC failed!";
-		return false;
-	}
-
-	// If the connection was successful create a timer to start receiving data on the socket
-	else
-	{
-		// TODO: Maybe move to thread?
-		GetWorld()->GetTimerManager().SetTimer(this->receiving_timer_, this, &UTwitchIRCComponent::ReceiveData, 0.05f, true);
-		this->connection_socket_ = ret_socket;
+		statusOut = connectionPair.Key;
+		messageOut = connectionPair.Value;
 		return true;
 	}
+
+	return false;
 }
 
-bool UTwitchIRCComponent::AuthenticateTwitchIRC(FString& _out_error)
+void FTwitchMessageReceiver::StopConnection(bool waitTillComplete)
 {
-	// If we don't have connection return an error
-	if (connection_socket_ == nullptr)
+	if(MessagesThread)
 	{
-		_out_error = "Connection is not initialized. Call 'Connect' before authenticating";
-		return false;
+		ShouldExit = true;
+		if(waitTillComplete)
+		{
+			MessagesThread->Kill(true);
+		}
 	}
-
-	// No point in trying to connect if user info was not setup
-	if (!b_has_run_user_setup_)
-	{
-		_out_error = "Can't authenticate. Setup user info first";
-		return false;
-	}
-
-	bool pass_ok = SendIRCMessage("PASS " + this->oauth_token_, false);
-	bool nick_ok = SendIRCMessage("NICK " + this->username_, false);
-
-	// Since the channel join might not be executed if the channel was not setup join_ok default value must be true
-	// for the method to return true if the two previous statements evaluate to true
-	bool join_ok = true;
-	if (this->channel_ != "")
-	{
-		join_ok = SendIRCMessage("JOIN #" + this->channel_, false);
-	}
-
-	bool b_success = pass_ok && nick_ok && join_ok;
-
-	if (!b_success)
-	{
-		_out_error = "Failed to send authentication message";
-		return false;
-	}
-
-	// TODO: Find a way to check for correct authentication
-	// Twitch returns a welcome message ("Welcome, GLHF") or error (:tmi.twitch.tv * NOTICE :Error logging) upon successful login
-	// Could use that in async to check for the connection
-	return (b_success);
 }
 
-void UTwitchIRCComponent::ReceiveData()
+FString FTwitchMessageReceiver::ReceiveFromConnection() const
 {
-	// If the socket does not exist just return
-	if (connection_socket_ == nullptr)
-	{
-		return;
-	}
-
 	TArray<uint8> data;
 	uint32 data_size;
 	bool received = false;
-	if (connection_socket_->HasPendingData(data_size))
+	if (ConnectionSocket->HasPendingData(data_size))
 	{
 		received = true;
 		data.SetNumUninitialized(data_size); // Make space for the data
 		int32 data_read;
-		connection_socket_->Recv(data.GetData(), data.Num(), data_read); // Receive the data. Hopefully the buffer is large enough
+		ConnectionSocket->Recv(data.GetData(), data.Num(), data_read); // Receive the data. Hopefully the buffer is large enough
 	}
 
-	FString f_string_data = "";
+	FString connectionMessage;
 	if (received)
 	{
-		const std::string c_string_data(reinterpret_cast<const char*>(data.GetData()), data.Num()); // Conversion from uint8 to char
-		f_string_data = FString(c_string_data.c_str()); // Conversion from TCHAR to FString
+		connectionMessage = ANSIBytesToString(data.GetData(), data.Num());
 	}
 
-	if (f_string_data != "")
-	{
-		TArray<FString> usernames;
-		TArray<FString> parsed_messages = ParseMessage(f_string_data, usernames);
-
-		for (int32 cycle_index = 0; cycle_index < parsed_messages.Num(); cycle_index++)
-		{
-			OnMessageReceived.Broadcast(parsed_messages[cycle_index], usernames[cycle_index]); // Fires the message reception event
-		}
-	}
+	return connectionMessage;
 }
 
-TArray<FString> UTwitchIRCComponent::ParseMessage(const FString _message, TArray<FString>& _out_sender_username, bool _b_filter_user_only)
+void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString>& out_sender_username, TArray<FString>& messagesOut)
 {
-	TArray<FString> ret_messages_content;
-
+	messagesOut.Reset();
+	
 	TArray<FString> message_lines;
-	_message.ParseIntoArrayLines(message_lines); // A single "message" from Twitch IRC could include multiple lines. Split them now
+	message.ParseIntoArrayLines(message_lines); // A single "message" from Twitch IRC could include multiple lines. Split them now
 
 	// Parse each line into its parts
 	// Each line from Twitch contains meta information and content
@@ -187,10 +359,9 @@ TArray<FString> UTwitchIRCComponent::ParseMessage(const FString _message, TArray
 	for (int32 cycle_line = 0; cycle_line < message_lines.Num(); cycle_line++)
 	{
 		// If we receive a PING immediately reply with a PONG and skip the line parsing
-		if (message_lines[cycle_line] == "PING :tmi.twitch.tv")
+		if (message_lines[cycle_line] == TEXT("PING :tmi.twitch.tv"))
 		{
-			//DEBUG_MSG( "PING RECEIVED" );
-			this->SendIRCMessage("PONG :tmi.twitch.tv", false);
+			SendIRCMessage(TEXT("PONG :tmi.twitch.tv"));
 			continue; // Skip line parsing
 		}
 
@@ -200,25 +371,35 @@ TArray<FString> UTwitchIRCComponent::ParseMessage(const FString _message, TArray
 		// Also have to account for	possible ":" inside the content itself
 		TArray<FString> message_parts;
 		message_lines[cycle_line].ParseIntoArray(message_parts, TEXT(":"));
+		if(!message_parts.Num())
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
+			continue;
+		}
 
 		// Meta parsing
 		// Meta info is split by whitespaces
 		TArray<FString> meta;
 		message_parts[0].ParseIntoArrayWS(meta);
+		if(meta.Num() < 2)
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
+			continue;
+		}
 
 		// Assume at this point the message is from a user, but just in case set it beforehand
 		// This is so that we can return an "empty" user if the message was of any other kind
 		// For example, messages from the server (like upon connection) don't have a username
-		FString sender_username = "";
-		if (meta[1] == "PRIVMSG") // Type of message should always be in position 1 (or at least I hope so)
+		FString sender_username;
+		if (meta[1] == TEXT("PRIVMSG")) // Type of message should always be in position 1 (or at least I hope so)
 		{
 			// Username should be the first part before the first "!"
-			meta[0].Split("!", &sender_username, nullptr);
+			meta[0].Split(TEXT("!"), &sender_username, nullptr);
 		}
 
-		// If user only message filtering is enabled and no username was found for this message line, skip it
-		if (_b_filter_user_only && sender_username == "")
+		if (sender_username.IsEmpty())
 		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
 			continue; // Skip line
 		}
 
@@ -233,21 +414,125 @@ TArray<FString> UTwitchIRCComponent::ParseMessage(const FString _message, TArray
 				for (int32 cycle_content = 2; cycle_content < message_parts.Num(); cycle_content++)
 				{
 					// Add back the ":" that was used as the splitter
-					message_content += ":" + message_parts[cycle_content];
+					message_content += TEXT(":") + message_parts[cycle_content];
 				}
 			}
-			ret_messages_content.Add(message_content);
-			_out_sender_username.Add(sender_username);
+			messagesOut.Add(message_content);
+			out_sender_username.Add(sender_username);
+		}
+		else if(message_parts.Num())
+		{
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_parts[0]));
 		}
 	}
-	return ret_messages_content;
 }
 
-UTwitchIRCComponent::~UTwitchIRCComponent()
+// Sets default values for this component's properties
+UTwitchIRCComponent::UTwitchIRCComponent()
+	: TwitchMessageReceiver(nullptr)
 {
-	if (connection_socket_ != nullptr)
+	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.bStartWithTickEnabled = false;
+}
+
+void UTwitchIRCComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	if(TwitchMessageReceiver.IsValid())
 	{
-		connection_socket_->Close();
-		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(connection_socket_);
+		bool stillConnected = true;
+		ETwitchConnectionMessage status; FString message;
+		while(TwitchMessageReceiver->PullConnectionMessage(status, message))
+		{
+			OnConnectionMessage.Broadcast(status, message);
+			if(status == ETwitchConnectionMessage::FAILED_TO_CONNECT ||
+				status == ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE ||
+				status == ETwitchConnectionMessage::DISCONNECTED)
+			{
+				stillConnected = false;
+			}
+		}
+
+		if(!stillConnected)
+		{
+			PrimaryComponentTick.SetTickFunctionEnable(false);
+			TwitchMessageReceiver = nullptr;
+		}
+		else
+		{
+			TArray<FString> usernames; TArray<FString> messages;
+			TwitchMessageReceiver->PullMessages(usernames, messages);
+			check(usernames.Num() == messages.Num());
+			for(int32 messageIndex = 0; messageIndex < messages.Num(); ++messageIndex)
+			{
+				OnMessageReceived.Broadcast(messages[messageIndex], usernames[messageIndex]);
+			}
+		}
 	}
+	else
+	{
+		PrimaryComponentTick.SetTickFunctionEnable(false);
+	}
+}
+
+void UTwitchIRCComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+
+	if(TwitchMessageReceiver.IsValid())
+	{
+		TwitchMessageReceiver->StopConnection(true);
+	}
+}
+
+void UTwitchIRCComponent::Connect(const FString& oauth, const FString& username, const FString& channel)
+{
+	if(TwitchMessageReceiver.IsValid())
+	{
+		OnConnectionMessage.Broadcast(ETwitchConnectionMessage::ERROR, TEXT("Already connected / connecting / pending!"));
+		return;
+	}
+	if(oauth.IsEmpty() || username.IsEmpty())
+	{
+		OnConnectionMessage.Broadcast(ETwitchConnectionMessage::ERROR, TEXT("Invalid connection parameters. Check your strings."));
+		return;
+	}
+
+	// Create the connection and messaging thread
+	TwitchMessageReceiver = MakeUnique<FTwitchMessageReceiver>();
+	TwitchMessageReceiver->StartConnection(oauth, username, channel);
+	// Tick our component which pulls messages off the queue
+	PrimaryComponentTick.SetTickFunctionEnable(true);
+}
+
+bool UTwitchIRCComponent::SendChatMessage(const FString& message, const FString channel)
+{
+	if(TwitchMessageReceiver.IsValid())
+	{
+		TwitchMessageReceiver->SendMessage(ETwitchSendMessageType::CHAT_MESSAGE, message, channel);
+		return true;
+	}
+
+	return false;
+}
+
+void UTwitchIRCComponent::JoinChannel(const FString& channel)
+{
+	if(!TwitchMessageReceiver.IsValid())
+	{
+		return;
+	}
+
+	TwitchMessageReceiver->SendMessage(ETwitchSendMessageType::JOIN_MESSAGE, TEXT(""), channel);
+}
+
+void UTwitchIRCComponent::Disconnect()
+{
+	if(!TwitchMessageReceiver.IsValid())
+	{
+		return;
+	}
+	
+	TwitchMessageReceiver->StopConnection(false);
 }

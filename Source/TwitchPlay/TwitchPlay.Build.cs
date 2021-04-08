@@ -8,6 +8,8 @@ public class TwitchPlay: ModuleRules
 	public TwitchPlay(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		
+		//OptimizeCode = CodeOptimization.Never;
 
 		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "Public"));
 		PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private"));
