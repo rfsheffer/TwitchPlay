@@ -21,8 +21,6 @@ You can also unregister commands that you don't need anymore at runtime. The onl
 
 The implementation uses FSockets and custom delegates to enable its functionalities.
 
-Right now authentication still needs some work so that an actual error is received when the login info is wrong (I will need to authenticate the user asynchronously).
-
 Only one object can subscribe to a custom command at a time. I might change that in later API versions.
 
 Documentation: https://goo.gl/kjg3s0
