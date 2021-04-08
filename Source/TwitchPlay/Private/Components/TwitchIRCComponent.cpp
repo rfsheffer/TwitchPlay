@@ -67,7 +67,7 @@ uint32 FTwitchMessageReceiver::Run()
 											     NAME_None);
 		if (GAIResult.Results.Num() == 0)
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Could not resolve hostname!")));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_CONNECT, TEXT("Could not resolve hostname!")));
 			return 1; // if the host could not be resolved return false
 		}
 
@@ -82,7 +82,7 @@ uint32 FTwitchMessageReceiver::Run()
 		// Socket creation might fail on certain subsystems
 		if (ret_socket == nullptr)
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Could not create socket!")));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_CONNECT, TEXT("Could not create socket!")));
 			return 1;
 		}
 
@@ -100,7 +100,7 @@ uint32 FTwitchMessageReceiver::Run()
 			ret_socket->Close();
 			sss->DestroySocket(ret_socket);
 
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT, TEXT("Connection to Twitch IRC failed!")));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_CONNECT, TEXT("Connection to Twitch IRC failed!")));
 			return 1;
 		}
 
@@ -118,7 +118,7 @@ uint32 FTwitchMessageReceiver::Run()
 			ret_socket->Close();
 			sss->DestroySocket(ret_socket);
 
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_CONNECT,
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_CONNECT,
 				TEXT("Could not send initial PASS and NICK messages for Auth")));
 			return 1;
 		}
@@ -136,11 +136,11 @@ uint32 FTwitchMessageReceiver::Run()
 				sss->DestroySocket(ConnectionSocket);
 				ConnectionSocket = nullptr;
 			
-				ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE, connectionMessage));
+				ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_AUTHENTICATE, connectionMessage));
 				return 1;
 			}
 
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::CONNECTED, connectionMessage));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::CONNECTED, connectionMessage));
 			
 			WaitingForAuth = false;
 
@@ -154,7 +154,7 @@ uint32 FTwitchMessageReceiver::Run()
 					sss->DestroySocket(ConnectionSocket);
 					ConnectionSocket = nullptr;
 			
-					ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE, TEXT("Failed to join channel")));
+					ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_AUTHENTICATE, TEXT("Failed to join channel")));
 					return 1;
 				}
 			}
@@ -199,7 +199,7 @@ uint32 FTwitchMessageReceiver::Run()
 					}
 					else
 					{
-						ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::ERROR,
+						ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::ERROR,
 							TEXT("Cannot send message. No channel specified, and not joined to a channel.")));
 					}
 				}
@@ -222,7 +222,7 @@ uint32 FTwitchMessageReceiver::Run()
 		}
 		else
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::DISCONNECTED, TEXT("Lost connection to server")));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::DISCONNECTED, TEXT("Lost connection to server")));
 			ShouldExit = true;
 		}
 	}
@@ -236,7 +236,7 @@ uint32 FTwitchMessageReceiver::Run()
 				// Part ways
 				SendIRCMessage(TEXT("PART #") + Channel);
 			}
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::DISCONNECTED, TEXT("Diconnected by request gracefully")));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::DISCONNECTED, TEXT("Diconnected by request gracefully")));
 		}
 		
 		ConnectionSocket->Close();
@@ -298,7 +298,7 @@ void FTwitchMessageReceiver::SendMessage(const ETwitchSendMessageType type, cons
 	}
 }
 
-bool FTwitchMessageReceiver::PullConnectionMessage(ETwitchConnectionMessage& statusOut, FString& messageOut)
+bool FTwitchMessageReceiver::PullConnectionMessage(ETwitchConnectionMessageType& statusOut, FString& messageOut)
 {
 	TwitchConnectionPair connectionPair;
 	if(ConnectionQueue->Dequeue(connectionPair))
@@ -373,7 +373,7 @@ void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString
 		message_lines[cycle_line].ParseIntoArray(message_parts, TEXT(":"));
 		if(!message_parts.Num())
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::MESSAGE, message_lines[cycle_line]));
 			continue;
 		}
 
@@ -383,7 +383,7 @@ void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString
 		message_parts[0].ParseIntoArrayWS(meta);
 		if(meta.Num() < 2)
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::MESSAGE, message_lines[cycle_line]));
 			continue;
 		}
 
@@ -399,7 +399,7 @@ void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString
 
 		if (sender_username.IsEmpty())
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_lines[cycle_line]));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::MESSAGE, message_lines[cycle_line]));
 			continue; // Skip line
 		}
 
@@ -422,7 +422,7 @@ void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString
 		}
 		else if(message_parts.Num())
 		{
-			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessage::MESSAGE, message_parts[0]));
+			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::MESSAGE, message_parts[0]));
 		}
 	}
 }
@@ -442,13 +442,13 @@ void UTwitchIRCComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 	if(TwitchMessageReceiver.IsValid())
 	{
 		bool stillConnected = true;
-		ETwitchConnectionMessage status; FString message;
+		ETwitchConnectionMessageType status; FString message;
 		while(TwitchMessageReceiver->PullConnectionMessage(status, message))
 		{
 			OnConnectionMessage.Broadcast(status, message);
-			if(status == ETwitchConnectionMessage::FAILED_TO_CONNECT ||
-				status == ETwitchConnectionMessage::FAILED_TO_AUTHENTICATE ||
-				status == ETwitchConnectionMessage::DISCONNECTED)
+			if(status == ETwitchConnectionMessageType::FAILED_TO_CONNECT ||
+				status == ETwitchConnectionMessageType::FAILED_TO_AUTHENTICATE ||
+				status == ETwitchConnectionMessageType::DISCONNECTED)
 			{
 				stillConnected = false;
 			}
@@ -490,12 +490,12 @@ void UTwitchIRCComponent::Connect(const FString& oauth, const FString& username,
 {
 	if(TwitchMessageReceiver.IsValid())
 	{
-		OnConnectionMessage.Broadcast(ETwitchConnectionMessage::ERROR, TEXT("Already connected / connecting / pending!"));
+		OnConnectionMessage.Broadcast(ETwitchConnectionMessageType::ERROR, TEXT("Already connected / connecting / pending!"));
 		return;
 	}
 	if(oauth.IsEmpty() || username.IsEmpty())
 	{
-		OnConnectionMessage.Broadcast(ETwitchConnectionMessage::ERROR, TEXT("Invalid connection parameters. Check your strings."));
+		OnConnectionMessage.Broadcast(ETwitchConnectionMessageType::ERROR, TEXT("Invalid connection parameters. Check your strings."));
 		return;
 	}
 

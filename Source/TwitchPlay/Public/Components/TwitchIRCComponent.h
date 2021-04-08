@@ -9,7 +9,7 @@
 #include "TwitchIRCComponent.generated.h"
 
 UENUM(BlueprintType)
-enum class ETwitchConnectionMessage : uint8
+enum class ETwitchConnectionMessageType : uint8
 {
 	// A connection and authentication was established.
 	CONNECTED,
@@ -32,7 +32,7 @@ enum class ETwitchConnectionMessage : uint8
  * _username (const FString&) - Username of who sent the message.
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FTwitchMessageReceived, const FString&, message, const FString&, username);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FTwitchConnectionMessage, const ETwitchConnectionMessage, type, const FString&, message);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FTwitchConnectionMessage, const ETwitchConnectionMessageType, type, const FString&, message);
 
 // Blob of user messages received
 struct FTwitchReceiveMessages
@@ -66,7 +66,7 @@ struct FTwitchSendMessage
 class FTwitchMessageReceiver final : public FRunnable
 {
 public:
-	using TwitchConnectionPair = TPair<ETwitchConnectionMessage, FString>;
+	using TwitchConnectionPair = TPair<ETwitchConnectionMessageType, FString>;
 	using FTwitchReceiveMessagesQueue = TQueue<FTwitchReceiveMessages, EQueueMode::Spsc>;
 	using FTwitchSendMessagesQueue = TQueue<FTwitchSendMessage, EQueueMode::Spsc>;
 	using FTwitchConnectionQueue = TQueue<TwitchConnectionPair, EQueueMode::Spsc>;
@@ -85,7 +85,7 @@ public:
 
 	void PullMessages(TArray<FString>& usernamesOut, TArray<FString>& messagesOut);
 	void SendMessage(const ETwitchSendMessageType type, const FString& message, const FString& channel);
-	bool PullConnectionMessage(ETwitchConnectionMessage& statusOut, FString& messageOut);
+	bool PullConnectionMessage(ETwitchConnectionMessageType& statusOut, FString& messageOut);
 
 	void StopConnection(bool waitTillComplete);
 
