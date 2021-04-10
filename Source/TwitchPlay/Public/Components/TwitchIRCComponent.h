@@ -89,6 +89,15 @@ public:
 
 	void StopConnection(bool waitTillComplete);
 
+	bool IsConnected() const { return bIsConnected; }
+
+	void GetConnectionInfo(FString& oauthOut, FString& usernameOut, FString& channelOut) const
+	{
+		oauthOut = Oauth;
+		usernameOut = Username;
+		channelOut = Channel;
+	}
+
 private:
 
 	FString ReceiveFromConnection() const;
@@ -123,6 +132,8 @@ private:
 	FRunnableThread* MessagesThread;
 
 	FThreadSafeBool ShouldExit;
+
+	FThreadSafeBool bIsConnected;
 
 	// Authentication token. Need to get it from official Twitch API
 	FString Oauth;
@@ -202,4 +213,24 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Setup")
 	void Disconnect();
+
+	/**
+	 * Has a connection been established? Not Pending?
+	 */
+	UFUNCTION(BlueprintPure, Category = "Info")
+	bool IsConnected() const;
+
+	/**
+	* Establishing a connection?
+	* Returns false if connected.
+	*/
+	UFUNCTION(BlueprintPure, Category = "Info")
+	bool IsPendingConnection() const;
+
+	/**
+	 * Get the current connection info
+	 * returns false if not connected
+	 */
+	UFUNCTION(BlueprintPure, Category = "Info")
+    bool GetConnectionInfo(FString& oauthOut, FString& usernameOut, FString& channelOut) const;
 };

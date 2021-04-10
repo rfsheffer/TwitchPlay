@@ -158,6 +158,8 @@ uint32 FTwitchMessageReceiver::Run()
 					return 1;
 				}
 			}
+
+			bIsConnected = true;
 		}
 		else
 		{
@@ -224,9 +226,11 @@ uint32 FTwitchMessageReceiver::Run()
 		{
 			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::DISCONNECTED, TEXT("Lost connection to server")));
 			ShouldExit = true;
+			bIsConnected = false;
 		}
 	}
 
+	bIsConnected = false;
 	if(ConnectionSocket)
 	{
 		if(ConnectionSocket->GetConnectionState() == ESocketConnectionState::SCS_Connected)
@@ -238,7 +242,7 @@ uint32 FTwitchMessageReceiver::Run()
 			}
 			ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::DISCONNECTED, TEXT("Diconnected by request gracefully")));
 		}
-		
+
 		ConnectionSocket->Close();
 		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ConnectionSocket);
 		ConnectionSocket = nullptr;
@@ -535,4 +539,25 @@ void UTwitchIRCComponent::Disconnect()
 	}
 	
 	TwitchMessageReceiver->StopConnection(false);
+}
+
+bool UTwitchIRCComponent::IsConnected() const
+{
+	return TwitchMessageReceiver.IsValid() && TwitchMessageReceiver->IsConnected();
+}
+
+bool UTwitchIRCComponent::IsPendingConnection() const
+{
+	return TwitchMessageReceiver.IsValid() && !TwitchMessageReceiver->IsConnected();
+}
+
+bool UTwitchIRCComponent::GetConnectionInfo(FString& oauthOut, FString& usernameOut, FString& channelOut) const
+{
+	if(!TwitchMessageReceiver.IsValid())
+	{
+		return false;
+	}
+
+	TwitchMessageReceiver->GetConnectionInfo(oauthOut, usernameOut, channelOut);
+	return true;
 }
