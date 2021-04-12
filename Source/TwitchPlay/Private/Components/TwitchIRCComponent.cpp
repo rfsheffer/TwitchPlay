@@ -10,6 +10,7 @@ FTwitchMessageReceiver::FTwitchMessageReceiver()
 	, MessagesThread(nullptr)
 	, ShouldExit(false)
 	, WaitingForAuth(false)
+	, NumAuthWaits(0)
 {
 	
 }
@@ -124,7 +125,7 @@ uint32 FTwitchMessageReceiver::Run()
 		}
 	}
 
-	while(WaitingForAuth)
+	while(WaitingForAuth && !ShouldExit)
 	{
 		FString connectionMessage = ReceiveFromConnection();
 		if(!connectionMessage.IsEmpty())
@@ -160,11 +161,21 @@ uint32 FTwitchMessageReceiver::Run()
 			}
 
 			bIsConnected = true;
+
+			// Request command capability
+			SendIRCMessage(TEXT("CAP REQ :twitch.tv/commands"));
 		}
 		else
 		{
 			// Wait a bit
-			FPlatformProcess::Sleep(0.1f);
+			FPlatformProcess::Sleep(0.5f);
+			++NumAuthWaits;
+			if(NumAuthWaits > 4)
+			{
+				NumAuthWaits = 0;
+				ShouldExit = true;
+				ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::FAILED_TO_AUTHENTICATE, TEXT("Server did not respond")));
+			}
 		}
 	}
 
@@ -185,7 +196,7 @@ uint32 FTwitchMessageReceiver::Run()
 
 			// Send our messages
 			FTwitchSendMessage sendMessage;
-			while(SendingQueue->Dequeue(sendMessage))
+			if(SendingQueue->Dequeue(sendMessage))
 			{
 				if(sendMessage.Type == ETwitchSendMessageType::CHAT_MESSAGE)
 				{
@@ -220,7 +231,7 @@ uint32 FTwitchMessageReceiver::Run()
 			}
 			
 			// Sleep a bit before pulling more messages
-			FPlatformProcess::Sleep(0.1f);
+			FPlatformProcess::Sleep(1.2f);
 		}
 		else
 		{
@@ -262,7 +273,7 @@ bool FTwitchMessageReceiver::SendIRCMessage(const FString& message, const FStrin
 		{
 			messageOut = FString::Printf(TEXT("PRIVMSG #%s :%s"), *channel, *message);
 		}
-		messageOut += TEXT("\n"); // Using C style strlen needs a terminator character or it will crash
+		messageOut += TEXT("\r\n");
 		const TCHAR* serialized_message = GetData(messageOut);
 		const int32 size = FCString::Strlen(serialized_message);
 		int32 out_sent;
@@ -515,6 +526,18 @@ bool UTwitchIRCComponent::SendChatMessage(const FString& message, const FString 
 	if(TwitchMessageReceiver.IsValid())
 	{
 		TwitchMessageReceiver->SendMessage(ETwitchSendMessageType::CHAT_MESSAGE, message, channel);
+		return true;
+	}
+
+	return false;
+}
+
+bool UTwitchIRCComponent::SendWhisper(const FString& userName, const FString& message, const FString channel)
+{
+	if(TwitchMessageReceiver.IsValid())
+	{
+		const FString whisperMessage = FString::Printf(TEXT("/w %s %s"), *userName, *message);
+		TwitchMessageReceiver->SendMessage(ETwitchSendMessageType::CHAT_MESSAGE, whisperMessage, channel);
 		return true;
 	}
 

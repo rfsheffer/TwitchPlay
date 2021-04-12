@@ -146,6 +146,9 @@ private:
 
 	// True while we are waiting for the auth reply from the server
 	bool WaitingForAuth;
+
+	// The number of times auth has slept
+	int32 NumAuthWaits;
 };
 
 /**
@@ -196,11 +199,23 @@ public:
 	/**
 	 * Send a message on the connected socket
 	 * @param message - The message
-	 * @param channel - The channel (or user) to send this message to
+	 * @param channel - The channel (or user channel) to send this message to
 	 * @return Whether the message was sent to the worker thread. Check your connection callback for errors.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Messages")
 	bool SendChatMessage(const FString& message, const FString channel = TEXT(""));
+
+	/**
+	* Send a whisper message to a specific user on a channel on the connected socket
+	* NOTE: The user account being used as a bot must have command rights for whispers to work. See the connection
+	* log to find out if your user is unable to send whispers in this way.
+	* @param userName - The user to whisper to
+	* @param message - The message
+	* @param channel - The channel (or user channel) to send this message to
+	* @return Whether the message was sent to the worker thread. Check your connection callback for errors.
+	*/
+	UFUNCTION(BlueprintCallable, Category = "Messages")
+	bool SendWhisper(const FString& userName, const FString& message, const FString channel = TEXT(""));
 
 	/**
 	 * If connected, join a new channel. If already in a channel, will leave it before joining the new one.
