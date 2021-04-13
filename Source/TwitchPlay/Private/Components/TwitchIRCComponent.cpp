@@ -11,6 +11,9 @@ FTwitchMessageReceiver::FTwitchMessageReceiver()
 	, ShouldExit(false)
 	, WaitingForAuth(false)
 	, NumAuthWaits(0)
+	, AccumulationTime(0)
+	, TimeBetweenMessages(1.2f)
+	, NextSendMessageTime(0)
 {
 	
 }
@@ -30,12 +33,13 @@ FTwitchMessageReceiver::~FTwitchMessageReceiver()
 	MessagesThread = nullptr;
 }
 
-void FTwitchMessageReceiver::StartConnection(const FString& oauth, const FString& username, const FString& channel)
+void FTwitchMessageReceiver::StartConnection(const FString& oauth, const FString& username, const FString& channel, const float timeBetweenMessages)
 {
 	checkf(!MessagesThread, TEXT("FTwitchMessageReceiver::StartConnection called more than once?"));
 	Oauth = oauth;
 	Username = username.ToLower();
 	Channel = channel.ToLower();
+	TimeBetweenMessages = timeBetweenMessages;
 	MessagesThread = FRunnableThread::Create(this, TEXT("FTwitchMessageReceiver"));
 }
 
@@ -162,13 +166,14 @@ uint32 FTwitchMessageReceiver::Run()
 
 			bIsConnected = true;
 
-			// Request command capability
+			// Request command capability (If the user has extended bot permissions this means something, else it is mostly ignored)
+			// This allows whispers to function, if the bot account has extendeed permissions.
 			SendIRCMessage(TEXT("CAP REQ :twitch.tv/commands"));
 		}
 		else
 		{
 			// Wait a bit
-			FPlatformProcess::Sleep(0.5f);
+			SleepReceiver(0.5f);
 			++NumAuthWaits;
 			if(NumAuthWaits > 4)
 			{
@@ -194,44 +199,49 @@ uint32 FTwitchMessageReceiver::Run()
 				}
 			}
 
-			// Send our messages
-			FTwitchSendMessage sendMessage;
-			if(SendingQueue->Dequeue(sendMessage))
+			if(NextSendMessageTime <= AccumulationTime)
 			{
-				if(sendMessage.Type == ETwitchSendMessageType::CHAT_MESSAGE)
+				// Send our messages
+				FTwitchSendMessage sendMessage;
+				if(SendingQueue->Dequeue(sendMessage))
 				{
-					if(!sendMessage.Channel.IsEmpty())
+					if(sendMessage.Type == ETwitchSendMessageType::CHAT_MESSAGE)
 					{
-						// Specific user private message
-						SendIRCMessage(sendMessage.Message, sendMessage.Channel);
+						if(!sendMessage.Channel.IsEmpty())
+						{
+							// Specific user private message
+							SendIRCMessage(sendMessage.Message, sendMessage.Channel);
+						}
+						else if(!Channel.IsEmpty())
+						{
+							// To the currently joined channel
+							SendIRCMessage(sendMessage.Message, Channel);
+						}
+						else
+						{
+							ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::ERROR,
+                                TEXT("Cannot send message. No channel specified, and not joined to a channel.")));
+						}
 					}
-					else if(!Channel.IsEmpty())
+					else if(sendMessage.Type == ETwitchSendMessageType::JOIN_MESSAGE)
 					{
-						// To the currently joined channel
-						SendIRCMessage(sendMessage.Message, Channel);
+						if(!Channel.IsEmpty())
+						{
+							SendIRCMessage(TEXT("PART #") + Channel);
+						}
+						Channel = sendMessage.Channel;
+						if(!Channel.IsEmpty())
+						{
+							SendIRCMessage(TEXT("JOIN #") + Channel);
+						}
 					}
-					else
-					{
-						ConnectionQueue->Enqueue(TwitchConnectionPair(ETwitchConnectionMessageType::ERROR,
-							TEXT("Cannot send message. No channel specified, and not joined to a channel.")));
-					}
-				}
-				else if(sendMessage.Type == ETwitchSendMessageType::JOIN_MESSAGE)
-				{
-					if(!Channel.IsEmpty())
-					{
-						SendIRCMessage(TEXT("PART #") + Channel);
-					}
-					Channel = sendMessage.Channel;
-					if(!Channel.IsEmpty())
-					{
-						SendIRCMessage(TEXT("JOIN #") + Channel);
-					}
+
+					NextSendMessageTime = AccumulationTime + TimeBetweenMessages;
 				}
 			}
 			
 			// Sleep a bit before pulling more messages
-			FPlatformProcess::Sleep(1.2f);
+			SleepReceiver(0.2f);
 		}
 		else
 		{
@@ -336,6 +346,12 @@ void FTwitchMessageReceiver::StopConnection(bool waitTillComplete)
 			MessagesThread->Kill(true);
 		}
 	}
+}
+
+void FTwitchMessageReceiver::SleepReceiver(float seconds)
+{
+	FPlatformProcess::Sleep(seconds);
+	AccumulationTime += seconds;
 }
 
 FString FTwitchMessageReceiver::ReceiveFromConnection() const
@@ -444,7 +460,8 @@ void FTwitchMessageReceiver::ParseMessage(const FString& message, TArray<FString
 
 // Sets default values for this component's properties
 UTwitchIRCComponent::UTwitchIRCComponent()
-	: TwitchMessageReceiver(nullptr)
+	: TimeBetweenChatMessages(1.2f)
+	, TwitchMessageReceiver(nullptr)
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = false;
@@ -516,7 +533,7 @@ void UTwitchIRCComponent::Connect(const FString& oauth, const FString& username,
 
 	// Create the connection and messaging thread
 	TwitchMessageReceiver = MakeUnique<FTwitchMessageReceiver>();
-	TwitchMessageReceiver->StartConnection(oauth, username, channel);
+	TwitchMessageReceiver->StartConnection(oauth, username, channel, TimeBetweenChatMessages);
 	// Tick our component which pulls messages off the queue
 	PrimaryComponentTick.SetTickFunctionEnable(true);
 }

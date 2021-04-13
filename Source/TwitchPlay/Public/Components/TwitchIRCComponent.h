@@ -74,7 +74,7 @@ public:
 	FTwitchMessageReceiver();
 	virtual ~FTwitchMessageReceiver();
 
-	void StartConnection(const FString& _oauth, const FString& _username, const FString& _channel);
+	void StartConnection(const FString& auth, const FString& username, const FString& channel, const float timeBetweenMessages);
 
 	//
 	// FRunnable interface.
@@ -99,6 +99,8 @@ public:
 	}
 
 private:
+
+	void SleepReceiver(float seconds);
 
 	FString ReceiveFromConnection() const;
 
@@ -149,6 +151,15 @@ private:
 
 	// The number of times auth has slept
 	int32 NumAuthWaits;
+
+	// A time accumulator while the thread is running. Precision isn't great, but accurate enough for general timing.
+	float AccumulationTime;
+
+	// The set time between messages
+	float TimeBetweenMessages;
+
+	// The next time to send a message
+	float NextSendMessageTime;
 };
 
 /**
@@ -172,6 +183,12 @@ public:
 	// Also includes general server messages from connection commands, join commands, etc.
 	UPROPERTY(BlueprintAssignable, Category = "Message Events")
 	FTwitchConnectionMessage OnConnectionMessage;
+
+	// The seconds delay between sending chat messages. This is set to a safe time by default, but if your bot has elevated
+	// permissions you might be able to set this to a shorter time.
+	UPROPERTY(EditAnywhere, Category = "Setup")
+	float TimeBetweenChatMessages;
+	
 
 private:
 
@@ -209,6 +226,7 @@ public:
 	* Send a whisper message to a specific user on a channel on the connected socket
 	* NOTE: The user account being used as a bot must have command rights for whispers to work. See the connection
 	* log to find out if your user is unable to send whispers in this way.
+	* To request bot extended privilages, see https://dev.twitch.tv/limit-increase
 	* @param userName - The user to whisper to
 	* @param message - The message
 	* @param channel - The channel (or user channel) to send this message to
